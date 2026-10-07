@@ -1,0 +1,60 @@
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# Python 캐시·빌드
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 로그·임시
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# 로컬 점검용 임시 파일
+_tmp_*
+
+# 비밀정보·개인 설정
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# 업로드·분석 결과·내보내기 (고객 VOC 원본 포함)
+output/
+uploads/
+exports/
+*.docx
+
+# 대용량 모델·모델 캐시
+models/
+hf_cache/
+.huggingface/
+*.gguf
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.onnx
+
+# 편집기·OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
