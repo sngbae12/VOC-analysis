@@ -1,0 +1,60 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Korean fonts (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-nanum fonts-nanum-coding fontconfig
+          fc-cache -f
+
+      - name: Korean fonts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fonts = Get-ChildItem "$env:WINDIR\Fonts" | Where-Object { $_.Name -match 'malgun|gulim|batang|Nanum' }
+          if (-not $fonts) { Write-Error 'Korean font files were not found in the Windows Fonts folder.' }
+          $fonts | Select-Object -First 15 Name
+
+      - name: requirements.txt encoding
+        run: python -c "from pathlib import Path; t=Path('requirements.txt').read_text(encoding='utf-8'); assert 'crewai==1.15.1' in t"
+
+      - name: Install
+        env:
+          CREWAI_DISABLE_TELEMETRY: "true"
+          OTEL_SDK_DISABLED: "true"
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest httpx
+          python -m pip check
+
+      - name: Tests
+        env:
+          CREWAI_DISABLE_TELEMETRY: "true"
+          OTEL_SDK_DISABLED: "true"
+          OPENAI_API_KEY: ""
+        run: python -m pytest -q

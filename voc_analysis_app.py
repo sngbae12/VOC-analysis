@@ -14,12 +14,14 @@
   wordcloud 1.9.6, python-docx 1.2.0, openai 2.44.0, kaleido 1.3.0
 """
 
+import hashlib
 import html
 import io
 import logging
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import traceback
@@ -133,18 +135,33 @@ def _find_korean_font() -> tuple[str, str, str]:
             fonts_dir / "batang.ttc",
         ]
     )
+    linux_fonts = [
+        Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"),
+        Path("/usr/share/fonts/opentype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf"),
+        Path("/usr/share/fonts/truetype/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+    ]
+    candidates.extend(linux_fonts)
     for font_path in candidates:
         found = _register_font_file(font_path)
         if found:
             return found
-    raise FileNotFoundError(
-        "한글 폰트(맑은 고딕 등)를 찾지 못했습니다. "
-        "Windows 폰트 폴더를 확인하거나 VOC_FONT_PATH에 ttf 경로를 지정하세요."
-    )
+    return "", "sans-serif", "Malgun Gothic"
 
 
 FONT_PATH, FONT_FAMILY, FONT_EAST_ASIA = _find_korean_font()
-plt.rcParams["font.family"] = FONT_FAMILY
+FONT_WARNING = ""
+if FONT_PATH:
+    plt.rcParams["font.family"] = FONT_FAMILY
+else:
+    FONT_WARNING = (
+        "한글 폰트(맑은 고딕, NanumGothic 등)를 찾지 못했습니다. "
+        "Windows 폰트 폴더를 확인하거나 VOC_FONT_PATH에 ttf 경로를 지정하세요."
+    )
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -163,6 +180,221 @@ STORE: dict[str, Any] = {
 }
 STORE_LOCK = threading.Lock()
 _RUNTIME = threading.local()
+
+SUPPORTED_PYTHON = ((3, 11), (3, 12), (3, 13))
+RECOMMENDED_PYTHON = (3, 11)
+APP_PORT = 7860
+DOWNLOAD_EXPORT_SUFFIXES = {".png", ".docx"}
+_EXPORT_DIGESTS: set[str] = set()
+_EXPORT_LOCK = threading.Lock()
+_GUARD_INSTALLED = False
+_EMPTY_DATE_TOKENS = {"", "nan", "none", "nat", "<na>", "null", "na"}
+
+
+def python_support_message(info: Any = None) -> tuple[bool, str]:
+    info = info or sys.version_info
+    major_minor = (int(info.major), int(info.minor))
+    rec = ".".join(str(x) for x in RECOMMENDED_PYTHON)
+    if major_minor in SUPPORTED_PYTHON:
+        return True, ""
+    current = f"{info.major}.{info.minor}.{getattr(info, 'micro', 0)}"
+    return False, (
+        f"This app supports Python 3.11, 3.12, and 3.13 only. "
+        f"Current version is Python {current}. "
+        f"Pinned CrewAI 1.15.1 does not allow Python 3.14, and pandas 3.0 needs 3.11 or newer. "
+        f"Python {rec} is recommended."
+    )
+
+
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.4)
+        return sock.connect_ex((host, port)) == 0
+
+
+def default_blocked_paths() -> list[str]:
+    return [
+        str((BASE_DIR / ".env").resolve()),
+        str((BASE_DIR / ".git").resolve()),
+        str((BASE_DIR / ".venv").resolve()),
+        str((BASE_DIR / "venv").resolve()),
+        str((BASE_DIR / ".verify_venv").resolve()),
+        str(UPLOAD_DIR.resolve()),
+        str((BASE_DIR / "voc_analysis_app.py").resolve()),
+        str(SAMPLE_CSV.resolve()),
+        str((BASE_DIR / "requirements.txt").resolve()),
+        str((BASE_DIR / ".env.example").resolve()),
+    ]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def register_export_file(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    candidate = Path(path)
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    if candidate.suffix.lower() not in DOWNLOAD_EXPORT_SUFFIXES:
+        return None
+    digest = file_sha256(candidate)
+    with _EXPORT_LOCK:
+        _EXPORT_DIGESTS.add(digest)
+    return candidate
+
+
+def _is_blocked_location(resolved: Path) -> bool:
+    env_file = (BASE_DIR / ".env").resolve()
+    if resolved == env_file or resolved.name.lower().startswith(".env"):
+        return True
+    for root in (
+        BASE_DIR / ".git",
+        BASE_DIR / ".venv",
+        BASE_DIR / "venv",
+        BASE_DIR / ".verify_venv",
+        UPLOAD_DIR,
+    ):
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    if resolved.suffix.lower() in {".py", ".pyc", ".bat", ".csv", ".md", ".json", ".toml"}:
+        return True
+    return False
+
+
+def is_safe_download_path(path: Path) -> bool:
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    if not resolved.exists() or not resolved.is_file():
+        return False
+    if _is_blocked_location(resolved):
+        return False
+    if resolved.suffix.lower() not in DOWNLOAD_EXPORT_SUFFIXES:
+        return False
+    try:
+        digest = file_sha256(resolved)
+    except OSError:
+        return False
+    with _EXPORT_LOCK:
+        return digest in _EXPORT_DIGESTS
+
+
+def install_download_guard() -> None:
+    global _GUARD_INSTALLED
+    if _GUARD_INSTALLED:
+        return
+    from fastapi import HTTPException
+    from gradio import route_utils, routes as gr_routes, utils as gr_utils
+    from gradio import static_server as gr_static
+    from gradio_client import utils as client_utils
+
+    original = route_utils.file_fetch
+
+    def guarded_file_fetch(path_or_url, request, blocks_or_config, upload_dir):
+        if client_utils.is_http_url_like(path_or_url):
+            return original(path_or_url, request, blocks_or_config, upload_dir)
+        try:
+            abs_path = Path(gr_utils.abspath(path_or_url))
+        except Exception as exc:
+            raise HTTPException(403, f"File not allowed: {path_or_url}.") from exc
+        if abs_path.exists() and abs_path.is_file() and not is_safe_download_path(abs_path):
+            raise HTTPException(403, f"File not allowed: {path_or_url}.")
+        return original(path_or_url, request, blocks_or_config, upload_dir)
+
+    route_utils.file_fetch = guarded_file_fetch
+    gr_routes.file_fetch = guarded_file_fetch
+    gr_static.file_fetch = guarded_file_fetch
+    _GUARD_INSTALLED = True
+
+
+def _date_token(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return ""
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        if 10000101 <= value <= 29991231:
+            return f"{value:08d}"
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer() and 10000101 <= int(value) <= 29991231:
+            return f"{int(value):08d}"
+        return str(value)
+    text = str(value).strip()
+    if re.fullmatch(r"\d{8}(?:\.0+)?", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def parse_voc_dates(series: pd.Series) -> tuple[pd.Series, int, int]:
+    """Parse YYYYMMDD integers/strings and ISO dates without treating ints as ns."""
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        parsed = pd.to_datetime(series, errors="coerce")
+        n_invalid = int(parsed.isna().sum())
+        return parsed, n_invalid, 0
+    tokens = series.map(_date_token)
+    empty_mask = tokens.str.lower().isin(_EMPTY_DATE_TOKENS)
+    remaining = ~empty_mask
+
+    ymd_mask = remaining & tokens.str.fullmatch(r"\d{8}", na=False)
+    if ymd_mask.any():
+        result.loc[ymd_mask] = pd.to_datetime(tokens.loc[ymd_mask], format="%Y%m%d", errors="coerce")
+        remaining = remaining & result.isna()
+
+    iso_mask = remaining & tokens.str.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", na=False)
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(tokens.loc[iso_mask], errors="coerce")
+        remaining = remaining & result.isna()
+
+    slash_mask = remaining & tokens.str.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", na=False)
+    if slash_mask.any():
+        result.loc[slash_mask] = pd.to_datetime(tokens.loc[slash_mask], errors="coerce")
+        remaining = remaining & result.isna()
+
+    dot_mask = remaining & tokens.str.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}", na=False)
+    if dot_mask.any():
+        result.loc[dot_mask] = pd.to_datetime(tokens.loc[dot_mask], errors="coerce")
+        remaining = remaining & result.isna()
+
+    still = remaining & result.isna() & tokens.str.contains(r"\d{4}", na=False)
+    still = still & ~tokens.str.fullmatch(r"\d{8}", na=False)
+    if still.any():
+        result.loc[still] = pd.to_datetime(tokens.loc[still], errors="coerce")
+
+    n_empty = int(empty_mask.sum())
+    n_invalid = int((~empty_mask & result.isna()).sum())
+    return result, n_invalid, n_empty
+
+
+def voc_period_text(df: pd.DataFrame) -> str:
+    dates = df["\uc77c\uc790"].dropna()
+    if len(dates) == 0:
+        return "-"
+    return f"{dates.min().strftime('%Y-%m-%d')} ~ {dates.max().strftime('%Y-%m-%d')}"
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +502,10 @@ def load_voc_csv(path: str | Path) -> pd.DataFrame:
             + f"\n현재 컬럼: {', '.join(map(str, df.columns))}"
         )
     df = df.copy()
-    df["일자"] = pd.to_datetime(df["일자"], errors="coerce")
+    parsed_dates, n_invalid, n_empty = parse_voc_dates(df["일자"])
+    df["일자"] = parsed_dates
+    df.attrs["date_invalid"] = n_invalid
+    df.attrs["date_empty"] = n_empty
     for col in ["고객명", "산업군", "지역", "제품명", "분야", "불만"]:
         df[col] = df[col].fillna("").astype(str).str.strip()
     df = df[df["불만"].str.len() > 0].reset_index(drop=True)
@@ -295,8 +530,12 @@ def save_ratio_png_matplotlib(table: pd.DataFrame, column: str, path: Path) -> P
     try:
         names = [str(v) for v in table["항목"].tolist()]
         values = [float(v) for v in table["비율(%)"].tolist()]
-        fp_title = font_manager.FontProperties(fname=FONT_PATH, size=16)
-        fp_axis = font_manager.FontProperties(fname=FONT_PATH, size=11)
+        if FONT_PATH:
+            fp_title = font_manager.FontProperties(fname=FONT_PATH, size=16)
+            fp_axis = font_manager.FontProperties(fname=FONT_PATH, size=11)
+        else:
+            fp_title = font_manager.FontProperties(family="sans-serif", size=16)
+            fp_axis = font_manager.FontProperties(family="sans-serif", size=11)
         fig, ax = plt.subplots(figsize=(12, 6.2))
         bars = ax.bar(names, values, color="#2F6FB3")
         ax.set_title(f"{column}별 VOC 비율", fontproperties=fp_title, color="#1F3A5F")
@@ -319,7 +558,7 @@ def save_ratio_png_matplotlib(table: pd.DataFrame, column: str, path: Path) -> P
         fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
         plt.close(fig)
         if path.exists() and path.stat().st_size > 0:
-            return path
+            return register_export_file(path)
     except Exception:
         plt.close("all")
     return None
@@ -420,6 +659,8 @@ def extract_keywords(texts: list[str], top_n: int = 80) -> dict[str, int]:
 
 
 def make_wordcloud(df: pd.DataFrame) -> tuple[Path, dict[str, int]]:
+    if not FONT_PATH:
+        raise FileNotFoundError(FONT_WARNING or "missing-korean-font")
     freq = extract_keywords(df["불만"].tolist())
     wc = WordCloud(
         font_path=FONT_PATH,
@@ -440,6 +681,7 @@ def make_wordcloud(df: pd.DataFrame) -> tuple[Path, dict[str, int]]:
     plt.tight_layout(pad=0)
     plt.savefig(path, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close()
+    register_export_file(path)
     with STORE_LOCK:
         STORE["wordcloud_path"] = path
         STORE["keywords"] = freq
@@ -447,11 +689,11 @@ def make_wordcloud(df: pd.DataFrame) -> tuple[Path, dict[str, int]]:
 
 
 def voc_overview(df: pd.DataFrame) -> str:
-    dates = df["일자"].dropna()
-    start = dates.min().strftime("%Y-%m-%d") if len(dates) else "-"
-    end = dates.max().strftime("%Y-%m-%d") if len(dates) else "-"
+    period = voc_period_text(df)
+    n_invalid = int(df.attrs.get("date_invalid", 0) or 0)
+    extra = f" / 일자 해석 실패 {n_invalid}건은 기간에서 제외" if n_invalid else ""
     return (
-        f"총 VOC {len(df):,}건 / 기간 {start} ~ {end} / "
+        f"총 VOC {len(df):,}건 / 기간 {period}{extra} / "
         f"산업군 {df['산업군'].nunique()}개 / 제품 {df['제품명'].nunique()}개 / "
         f"분야 {df['분야'].nunique()}개"
     )
@@ -632,11 +874,11 @@ def generate_word_report(issue_analysis: str, missing_images: list[str] | None =
         wc_path = STORE.get("wordcloud_path")
 
     if industry_table is None:
-        industry_table, _, industry_chart = make_ratio_bar(df, "산업군")
+        industry_table = ratio_table(df, "산업군")
     if field_table is None:
-        field_table, _, field_chart = make_ratio_bar(df, "분야")
-    if wc_path is None or not Path(wc_path).exists():
-        wc_path, _ = make_wordcloud(df)
+        field_table = ratio_table(df, "분야")
+    if wc_path is not None and not Path(wc_path).exists():
+        wc_path = None
 
     doc = Document()
     section = doc.sections[0]
@@ -653,7 +895,11 @@ def generate_word_report(issue_analysis: str, missing_images: list[str] | None =
         except KeyError:
             pass
 
-    add_kr_heading(doc, "고객사 VOC 분석 보고서", level=0)
+    omitted_early = list(missing_images or [])
+    title = "고객사 VOC 분석 보고서"
+    if omitted_early:
+        title = "고객사 VOC 분석 보고서 (그림 누락 · 불완전)"
+    add_kr_heading(doc, title, level=0)
     add_kr_paragraph(doc, voc_overview(df), size=11, color=ACCENT, space_after=2)
     add_kr_paragraph(
         doc,
@@ -729,6 +975,7 @@ def generate_word_report(issue_analysis: str, missing_images: list[str] | None =
 
     out_path = EXPORT_DIR / f"VOC분석보고서_{stamp()}.docx"
     doc.save(str(out_path))
+    register_export_file(out_path)
     with STORE_LOCK:
         STORE["report_path"] = out_path
         STORE["issue_analysis"] = issue_analysis
@@ -974,6 +1221,10 @@ def friendly_error(exc: BaseException) -> str:
         return "파일 글자를 읽지 못했습니다. UTF-8 CSV로 저장한 뒤 다시 시도해 주세요."
     if "유효한 불만" in text:
         return "불만 내용이 있는 행이 없습니다. 다른 CSV를 선택해 주세요."
+    if "missing-korean-font" in text or "한글 폰트" in text:
+        return (
+            "한글 폰트를 찾지 못했습니다. Windows 맑은 고딕이나 VOC_FONT_PATH에 TTF 경로를 지정한 뒤 다시 시도해 주세요."
+        )
     if "먼저" in text and "업로드" in text:
         return "아직 적용된 VOC 데이터가 없습니다. 데이터 불러오기에서 CSV를 적용하거나 실습 샘플을 선택해 주세요."
     if "통계 항목" in text:
@@ -1054,10 +1305,7 @@ def display_stats_table(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def snapshot_from_df(df: pd.DataFrame, source_kind: str, source_label: str) -> dict[str, Any]:
-    dates = df["일자"].dropna()
-    period = "-"
-    if len(dates):
-        period = f"{dates.min().strftime('%Y-%m-%d')} ~ {dates.max().strftime('%Y-%m-%d')}"
+    period = voc_period_text(df)
     state = empty_state()
     state.update(
         {
@@ -1140,7 +1388,7 @@ def render_upload_cards(state: dict[str, Any]) -> str:
     </div>
     <div class="cards">
       <div class="card"><div class="k">VOC 건수</div><div class="v">{state["row_count"]:,}</div><div class="s">불만 내용이 있는 행</div></div>
-      <div class="card"><div class="k">기간</div><div class="v">{state.get("period")}</div><div class="s">일자 기준</div></div>
+      <div class="card"><div class="k">기간</div><div class="v">{esc(state.get("period"))}</div><div class="s">일자 기준</div></div>
       <div class="card"><div class="k">산업군</div><div class="v">{state.get("n_industry")}</div><div class="s">고유 값 수</div></div>
       <div class="card"><div class="k">제품 / 분야</div><div class="v">{state.get("n_product")} / {state.get("n_field")}</div><div class="s">고유 값 수</div></div>
     </div>
@@ -1263,6 +1511,12 @@ def apply_loaded_df(df: pd.DataFrame, source_kind: str, source_label: str, logge
         STORE["keywords"] = {}
         STORE["issue_analysis"] = ""
         STORE["report_path"] = None
+        STORE["report_missing_images"] = []
+    n_invalid = int(df.attrs.get("date_invalid", 0) or 0)
+    if n_invalid:
+        logger(
+            f"일자 {n_invalid}건은 지원 형식이 아니어 기간 계산에서 제외했습니다."
+        )
     logger(voc_overview(df))
     return snapshot_from_df(df, source_kind, source_label)
 
@@ -1386,6 +1640,8 @@ def do_report(logger: Callable[[str], None]) -> dict[str, Any]:
     except Exception as exc:
         missing_images.append("워드클라우드")
         logger(f"워드클라우드 실패: {exc}")
+        with STORE_LOCK:
+            STORE["wordcloud_path"] = None
 
     digest = build_voc_digest(df)
     logger("통계 요약 작성 완료. 이슈 문장만 OpenAI를 사용합니다.")
@@ -1948,8 +2204,9 @@ def build_ui() -> gr.Blocks:
                 notes.append("넣지 못한 그림이 있어 완전한 보고서는 아닙니다: " + ", ".join(str(m) for m in missing))
             if not notes:
                 notes.append("아래 미리보기와 다운로드 파일은 이번 작업의 같은 이슈 내용입니다.")
+            report_title = "VOC 분석 보고서 (그림 누락 · 불완전)" if missing else "VOC 분석 보고서"
             head = (
-                f'<div class="result-head"><h2>VOC 분석 보고서</h2>'
+                f'<div class="result-head"><h2>{report_title}</h2>'
                 f'<p class="result-sub">분석 대상: {esc(state.get("source_label"))} · {esc(" ".join(notes))} '
                 f"자료에 없는 일정·담당자는 단정하지 않습니다.</p></div>"
             )
@@ -1990,19 +2247,48 @@ def build_ui() -> gr.Blocks:
         btn_stats.click(ui_stats, inputs=[col_dd, app_state], outputs=stats_outs, **event_kw)
         btn_wc.click(ui_wordcloud, inputs=[app_state], outputs=wc_outs, **event_kw)
         btn_report.click(ui_report, inputs=[app_state, api_key_in], outputs=report_outs, **event_kw)
+    return configure_file_access(demo)
+
+
+def configure_file_access(demo: gr.Blocks) -> gr.Blocks:
+    demo.allowed_paths = [str(EXPORT_DIR.resolve())]
+    demo.blocked_paths = default_blocked_paths()
+    install_download_guard()
     return demo
 
 
 def main() -> None:
-    demo = build_ui()
+    ok, msg = python_support_message()
+    if not ok:
+        rec = ".".join(str(x) for x in RECOMMENDED_PYTHON)
+        kr = (
+            f"이 앱은 Python 3.11, 3.12, 3.13에서만 설치·실행할 수 있습니다. "
+            f"현재는 Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}입니다. "
+            f"고정된 CrewAI 1.15.1은 Python 3.14를 허용하지 않고, pandas 3.0은 3.11 이상이 필요합니다. "
+            f"Python {rec}을 권장합니다."
+        )
+        print(kr, file=sys.stderr)
+        print(msg, file=sys.stderr)
+        raise SystemExit(1)
+    if FONT_WARNING:
+        print("경고: " + FONT_WARNING, file=sys.stderr)
+    if port_in_use(APP_PORT):
+        print(
+            f"포트 {APP_PORT}이 이미 사용 중입니다. "
+            f"실행 중인 앱을 종료하거나 http://127.0.0.1:{APP_PORT} 으로 접속하세요.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    demo = configure_file_access(build_ui())
     demo.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=APP_PORT,
         inbrowser=True,
         theme=gr.themes.Soft(font=[FONT_FAMILY, "sans-serif"]),
         css=APP_CSS,
         footer_links=["gradio"],
-        allowed_paths=[str(EXPORT_DIR)],
+        allowed_paths=[str(EXPORT_DIR.resolve())],
+        blocked_paths=default_blocked_paths(),
         show_error=False,
     )
 

@@ -24,9 +24,12 @@ logs/
 tmp/
 temp/
 .cache/
+.gradio/
 
 # 로컬 점검용 임시 파일
 _tmp_*
+_patch_*.py
+_write_*.py
 
 # 비밀정보·개인 설정
 .env
