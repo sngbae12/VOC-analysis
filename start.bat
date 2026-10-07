@@ -7,7 +7,7 @@ if exist ".venv\Scripts\python.exe" (
 ) else (
   where python >nul 2>&1
   if errorlevel 1 (
-    echo Python을 찾지 못했습니다. Python 3.10 이상을 설치하거나 프로젝트에 .venv를 만들어 주세요.
+    echo Python을 찾지 못했습니다. Python 3.11 이상을 설치하거나 프로젝트에 .venv를 만들어 주세요.
     pause
     exit /b 1
   )

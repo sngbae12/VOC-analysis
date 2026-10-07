@@ -3,9 +3,8 @@
 11장 실습: 고객사 VOC 분석 Agent (CrewAI + Gradio)
 
 구성
-  - VOC Agent   : CSV 로드, 통계/막대그래프, 워드클라우드
-  - Issue Agent : 산업군별 주요 이슈·개선과제 도출
-  - Report Agent: 분석 결과를 한글 워드 보고서로 생성
+  - 로컬 처리    : CSV 로드, 통계/막대그래프, 워드클라우드, DOCX 저장
+  - Issue Agent : 보고서 이슈 문장만 OpenAI/CrewAI로 생성
 
 실행
   python voc_analysis_app.py
@@ -15,7 +14,7 @@
   wordcloud 1.9.6, python-docx 1.2.0, openai 2.44.0, kaleido 1.3.0
 """
 
-import hashlib
+import html
 import io
 import logging
 import os
@@ -36,6 +35,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import pandas as pd
 import plotly.graph_objects as go
 from dotenv import load_dotenv
@@ -58,8 +58,11 @@ import gradio as gr
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
+EXPORT_DIR = OUTPUT_DIR / "exports"
+UPLOAD_DIR = OUTPUT_DIR / "uploads"
 SAMPLE_CSV = BASE_DIR / "sample_voc.csv"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+for _dir in (OUTPUT_DIR, EXPORT_DIR, UPLOAD_DIR):
+    _dir.mkdir(parents=True, exist_ok=True)
 
 REQUIRED_COLUMNS = ["순번", "일자", "고객명", "산업군", "지역", "제품명", "분야", "불만"]
 STAT_COLUMNS = ["산업군", "제품명", "분야"]
@@ -88,26 +91,52 @@ ACCENT = RGBColor(0x2F, 0x6F, 0xB3)
 DARK = RGBColor(0x22, 0x22, 0x22)
 
 
+_EAST_ASIA_NAMES = {
+    "Malgun Gothic": "맑은 고딕",
+    "Gulim": "굴림",
+    "Batang": "바탕",
+    "Hancom Gothic": "한컴고딕",
+}
+
+
+def _register_font_file(font_path: Path) -> tuple[str, str, str] | None:
+    if not font_path.exists():
+        return None
+    try:
+        font_manager.fontManager.addfont(str(font_path))
+    except Exception:
+        pass
+    try:
+        prop = font_manager.FontProperties(fname=str(font_path))
+        family = (prop.get_name() or "").strip()
+    except Exception:
+        return None
+    if not family:
+        return None
+    east = _EAST_ASIA_NAMES.get(family, family)
+    return str(font_path), family, east
+
+
 def _find_korean_font() -> tuple[str, str, str]:
     """(ttf 경로, Plotly/Matplotlib 패밀리명, Word 동아시아 폰트명)을 반환합니다."""
-    candidates: list[tuple[Path, str, str]] = []
+    candidates: list[Path] = []
     custom = (os.getenv("VOC_FONT_PATH") or "").strip()
     if custom:
-        custom_path = Path(custom).expanduser()
-        candidates.append((custom_path, custom_path.stem, custom_path.stem))
+        candidates.append(Path(custom).expanduser())
     fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
     candidates.extend(
         [
-            (fonts_dir / "malgun.ttf", "Malgun Gothic", "맑은 고딕"),
-            (fonts_dir / "malgunbd.ttf", "Malgun Gothic", "맑은 고딕"),
-            (fonts_dir / "Hancom Gothic Regular.ttf", "Hancom Gothic", "한컴고딕"),
-            (fonts_dir / "gulim.ttc", "Gulim", "굴림"),
-            (fonts_dir / "batang.ttc", "Batang", "바탕"),
+            fonts_dir / "malgun.ttf",
+            fonts_dir / "malgunbd.ttf",
+            fonts_dir / "Hancom Gothic Regular.ttf",
+            fonts_dir / "gulim.ttc",
+            fonts_dir / "batang.ttc",
         ]
     )
-    for font_path, family, east_asia in candidates:
-        if font_path.exists():
-            return str(font_path), family, east_asia
+    for font_path in candidates:
+        found = _register_font_file(font_path)
+        if found:
+            return found
     raise FileNotFoundError(
         "한글 폰트(맑은 고딕 등)를 찾지 못했습니다. "
         "Windows 폰트 폴더를 확인하거나 VOC_FONT_PATH에 ttf 경로를 지정하세요."
@@ -130,11 +159,10 @@ STORE: dict[str, Any] = {
     "keywords": {},
     "issue_analysis": "",
     "report_path": None,
+    "chart_errors": {},
 }
 STORE_LOCK = threading.Lock()
 _RUNTIME = threading.local()
-_LLM: LLM | None = None
-_LLM_KEY_FP: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -183,21 +211,20 @@ def resolve_api_key() -> str:
     return (os.getenv("OPENAI_API_KEY") or "").strip()
 
 
-def get_llm() -> LLM:
-    global _LLM, _LLM_KEY_FP
-    api_key = resolve_api_key()
-    if not api_key:
+def create_llm(api_key: str) -> LLM:
+    cleaned = (api_key or "").strip()
+    if not cleaned:
         raise RuntimeError("api-key-missing")
-    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-    if _LLM is None or _LLM_KEY_FP != fingerprint:
-        _LLM = LLM(
-            model=MODEL_NAME,
-            api_key=api_key,
-            temperature=0.2,
-            timeout=180,
-        )
-        _LLM_KEY_FP = fingerprint
-    return _LLM
+    return LLM(
+        model=MODEL_NAME,
+        api_key=cleaned,
+        temperature=0.2,
+        timeout=180,
+    )
+
+
+def esc(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
 
 
 def require_df() -> pd.DataFrame:
@@ -263,7 +290,42 @@ def ratio_table(df: pd.DataFrame, column: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def make_ratio_bar(df: pd.DataFrame, column: str) -> tuple[pd.DataFrame, go.Figure, Path]:
+def save_ratio_png_matplotlib(table: pd.DataFrame, column: str, path: Path) -> Path | None:
+    """Chrome/Kaleido 없이 보고서용 PNG를 저장합니다. 실패하면 None을 반환합니다."""
+    try:
+        names = [str(v) for v in table["항목"].tolist()]
+        values = [float(v) for v in table["비율(%)"].tolist()]
+        fp_title = font_manager.FontProperties(fname=FONT_PATH, size=16)
+        fp_axis = font_manager.FontProperties(fname=FONT_PATH, size=11)
+        fig, ax = plt.subplots(figsize=(12, 6.2))
+        bars = ax.bar(names, values, color="#2F6FB3")
+        ax.set_title(f"{column}별 VOC 비율", fontproperties=fp_title, color="#1F3A5F")
+        ax.set_xlabel(column, fontproperties=fp_axis)
+        ax.set_ylabel("비율(%)", fontproperties=fp_axis)
+        ax.set_ylim(0, max(values) * 1.18 if values else 1)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontproperties(fp_axis)
+        plt.xticks(rotation=18, ha="right")
+        for bar, val in zip(bars, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{val:.2f}%",
+                ha="center",
+                va="bottom",
+                fontproperties=fp_axis,
+            )
+        fig.tight_layout()
+        fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+        plt.close(fig)
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    except Exception:
+        plt.close("all")
+    return None
+
+
+def make_ratio_bar(df: pd.DataFrame, column: str) -> tuple[pd.DataFrame, go.Figure, Path | None]:
     table = ratio_table(df, column)
     x = table["항목"].tolist()
     y = [float(v) for v in table["비율(%)"].tolist()]
@@ -303,13 +365,16 @@ def make_ratio_bar(df: pd.DataFrame, column: str) -> tuple[pd.DataFrame, go.Figu
         legend=dict(title_text="지표"),
     )
     fig.update_yaxes(range=[0, max(y) * 1.18 if y else 1])
-    png_path = OUTPUT_DIR / f"voc_ratio_{column}_{stamp()}.png"
-    fig.write_image(str(png_path), scale=2, width=1200, height=620)
+    png_path = EXPORT_DIR / f"voc_ratio_{column}_{stamp()}.png"
+    saved = save_ratio_png_matplotlib(table, column, png_path)
     with STORE_LOCK:
-        STORE["charts"][column] = png_path
+        STORE["charts"][column] = saved
         STORE["stats"][column] = table
         STORE["charts"][f"{column}_fig"] = fig
-    return table, fig, png_path
+        if saved is None:
+            STORE["chart_errors"] = dict(STORE.get("chart_errors") or {})
+            STORE["chart_errors"][column] = "비율 그림을 PNG로 저장하지 못했습니다."
+    return table, fig, saved
 
 
 _TOKEN_SPLIT = re.compile(r"[^가-힣A-Za-z0-9+\-]+")
@@ -368,7 +433,7 @@ def make_wordcloud(df: pd.DataFrame) -> tuple[Path, dict[str, int]]:
         colormap="tab20",
         regexp=r"[가-힣A-Za-z0-9+\-]+",
     ).generate_from_frequencies(freq)
-    path = OUTPUT_DIR / f"voc_wordcloud_{stamp()}.png"
+    path = EXPORT_DIR / f"voc_wordcloud_{stamp()}.png"
     plt.figure(figsize=(14, 8))
     plt.imshow(wc, interpolation="bilinear")
     plt.axis("off")
@@ -521,12 +586,17 @@ def add_stats_table(doc: Document, table_df: pd.DataFrame) -> None:
     doc.add_paragraph()
 
 
-def add_picture_if_exists(doc: Document, path: Path | None) -> None:
+def add_picture_if_exists(doc: Document, path: Path | None) -> bool:
     if path and Path(path).exists():
-        doc.add_picture(str(path), width=Cm(16.0))
-        last = doc.paragraphs[-1]
-        last.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        last.paragraph_format.space_after = Pt(10)
+        try:
+            doc.add_picture(str(path), width=Cm(16.0))
+            last = doc.paragraphs[-1]
+            last.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            last.paragraph_format.space_after = Pt(10)
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def write_markdown_like(doc: Document, text: str) -> None:
@@ -552,7 +622,7 @@ def write_markdown_like(doc: Document, text: str) -> None:
             add_kr_paragraph(doc, stripped, size=11, space_after=4)
 
 
-def generate_word_report(issue_analysis: str) -> Path:
+def generate_word_report(issue_analysis: str, missing_images: list[str] | None = None) -> Path:
     df = require_df()
     with STORE_LOCK:
         industry_table = STORE["stats"].get("산업군")
@@ -587,7 +657,7 @@ def generate_word_report(issue_analysis: str) -> Path:
     add_kr_paragraph(doc, voc_overview(df), size=11, color=ACCENT, space_after=2)
     add_kr_paragraph(
         doc,
-        f"작성일 {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  CrewAI VOC / Issue / Report Agent",
+        f"작성일 {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  통계·그림은 이 컴퓨터에서 계산",
         size=10,
         color=RGBColor(0x66, 0x66, 0x66),
         space_after=12,
@@ -600,19 +670,27 @@ def generate_word_report(issue_analysis: str) -> Path:
         space_after=14,
     )
 
+    omitted: list[str] = list(missing_images or [])
+
     add_kr_heading(doc, "1. 산업군별 VOC 통계", level=1)
     add_kr_paragraph(doc, "산업군 기준 VOC 건수와 비중(소수점 둘째 자리)입니다.", size=11)
     add_stats_table(doc, industry_table)
-    add_picture_if_exists(doc, industry_chart)
+    if not add_picture_if_exists(doc, industry_chart):
+        omitted.append("산업군 비율 그림")
+        add_kr_paragraph(doc, "산업군 비율 그림을 이번 보고서에 넣지 못했습니다.", color=RGBColor(0x88, 0x00, 0x00))
 
     add_kr_heading(doc, "2. 분야별 VOC 통계", level=1)
     add_kr_paragraph(doc, "품질·납기·기술지원 등 분야 기준 VOC 비중입니다.", size=11)
     add_stats_table(doc, field_table)
-    add_picture_if_exists(doc, field_chart)
+    if not add_picture_if_exists(doc, field_chart):
+        omitted.append("분야 비율 그림")
+        add_kr_paragraph(doc, "분야 비율 그림을 이번 보고서에 넣지 못했습니다.", color=RGBColor(0x88, 0x00, 0x00))
 
     add_kr_heading(doc, "3. 불만 키워드 워드클라우드", level=1)
     add_kr_paragraph(doc, "불만 텍스트에서 추출한 핵심 키워드의 상대 빈도입니다.", size=11)
-    add_picture_if_exists(doc, wc_path)
+    if not add_picture_if_exists(doc, wc_path):
+        omitted.append("워드클라우드")
+        add_kr_paragraph(doc, "워드클라우드 그림을 이번 보고서에 넣지 못했습니다.", color=RGBColor(0x88, 0x00, 0x00))
 
     add_kr_heading(doc, "4. 주요 이슈", level=1)
     issue_body = issue_analysis or ""
@@ -630,6 +708,17 @@ def generate_word_report(issue_analysis: str) -> Path:
         add_kr_heading(doc, "5. 개선과제 및 대응방안", level=1)
         add_kr_paragraph(doc, "이슈 분석 결과에 대응방안이 포함되지 않았습니다. Issue Agent 출력을 확인하세요.")
 
+    unique_omitted = list(dict.fromkeys(omitted))
+    if unique_omitted:
+        add_kr_paragraph(
+            doc,
+            "이 파일은 그림이 빠져 있어 완전한 보고서가 아닙니다. 넣지 못한 항목: "
+            + ", ".join(unique_omitted),
+            size=10,
+            color=RGBColor(0x88, 0x00, 0x00),
+            space_after=8,
+        )
+
     add_kr_paragraph(
         doc,
         "※ 수치는 업로드 CSV에서 계산한 값이며, 자료에 없는 건수·일정·담당자는 단정하지 않았습니다.",
@@ -638,11 +727,12 @@ def generate_word_report(issue_analysis: str) -> Path:
         space_after=0,
     )
 
-    out_path = OUTPUT_DIR / f"VOC분석보고서_{stamp()}.docx"
+    out_path = EXPORT_DIR / f"VOC분석보고서_{stamp()}.docx"
     doc.save(str(out_path))
     with STORE_LOCK:
         STORE["report_path"] = out_path
         STORE["issue_analysis"] = issue_analysis
+        STORE["report_missing_images"] = unique_omitted
     return out_path
 
 
@@ -682,7 +772,7 @@ def create_voc_word_report_tool(issue_analysis: str) -> str:
 # ---------------------------------------------------------------------------
 # Agent / Crew
 # ---------------------------------------------------------------------------
-def make_voc_agent() -> Agent:
+def make_voc_agent(llm: LLM) -> Agent:
     return Agent(
         role="VOC 데이터 분석가",
         goal="고객 VOC CSV를 정확히 읽고 항목별 비율 통계, 시각화, 워드클라우드를 생성한다.",
@@ -691,7 +781,7 @@ def make_voc_agent() -> Agent:
             "숫자는 원본 CSV에서만 계산하고, 비율은 소수점 둘째 자리까지 표기합니다. "
             "시각화와 워드클라우드는 제공된 도구만 사용합니다."
         ),
-        llm=get_llm(),
+        llm=llm,
         tools=[analyze_voc_ratio_tool, create_voc_wordcloud_tool],
         verbose=True,
         allow_delegation=False,
@@ -700,7 +790,7 @@ def make_voc_agent() -> Agent:
     )
 
 
-def make_issue_agent() -> Agent:
+def make_issue_agent(llm: LLM) -> Agent:
     return Agent(
         role="VOC 이슈 도출 전문가",
         goal="산업군별 주요 VOC를 분석해 핵심 이슈와 개선과제를 도출한다.",
@@ -709,7 +799,7 @@ def make_issue_agent() -> Agent:
             "사실(Fact)만 데이터에 두고, 이슈(Issue)와 권고(Recommend)를 연결합니다. "
             "자료에 없는 수치·일정·담당자를 만들지 않습니다."
         ),
-        llm=get_llm(),
+        llm=llm,
         tools=[],
         verbose=True,
         allow_delegation=False,
@@ -718,7 +808,7 @@ def make_issue_agent() -> Agent:
     )
 
 
-def make_report_agent() -> Agent:
+def make_report_agent(llm: LLM) -> Agent:
     return Agent(
         role="VOC 보고서 작성가",
         goal="VOC 통계와 이슈 분석 결과를 한글 워드 보고서로 만든다.",
@@ -727,7 +817,7 @@ def make_report_agent() -> Agent:
             "통계 표·그래프·워드클라우드·주요이슈·대응방안이 한 파일에 들어가도록 "
             "보고서 생성 도구를 반드시 호출합니다."
         ),
-        llm=get_llm(),
+        llm=llm,
         tools=[create_voc_word_report_tool],
         verbose=True,
         allow_delegation=False,
@@ -862,7 +952,7 @@ def persist_user_csv(file_obj: Any) -> tuple[Path, str]:
         raise ValueError("empty-file")
     raw = src_path.read_bytes()
     name = src_path.name
-    dest = OUTPUT_DIR / f"upload_{stamp()}_{name}"
+    dest = UPLOAD_DIR / f"upload_{stamp()}_{name}"
     dest.write_bytes(raw)
     return dest, name
 
@@ -893,11 +983,20 @@ def friendly_error(exc: BaseException) -> str:
             "OpenAI API 키가 없습니다. 화면에서 키를 입력하거나 환경 변수 OPENAI_API_KEY를 설정하세요. "
             "통계 막대그래프와 워드클라우드는 키 없이 이 컴퓨터에서 만들 수 있습니다."
         )
-    if "incorrect api key" in low or "invalid_api_key" in low or "invalid api key" in low:
-        return "OpenAI API 호출이 거부되었습니다. 키를 확인한 뒤 다시 시도해 주세요."
-    if "429" in text or "rate limit" in low:
-        return "OpenAI 요청 한도를 넘었습니다. 잠시 후 다시 시도해 주세요."
-    if "timeout" in low or "connection" in low:
+    if (
+        "incorrect api key" in low
+        or "invalid_api_key" in low
+        or "invalid api key" in low
+        or "unauthorized" in low
+        or " 401" in f" {text}"
+        or "status code: 401" in low
+    ):
+        return "OpenAI 인증에 실패했습니다. 키를 확인한 뒤 다시 시도해 주세요."
+    if "429" in text or "rate limit" in low or "insufficient_quota" in low:
+        return "OpenAI 요청 한도 또는 할당량을 넘었습니다. 잠시 후 다시 시도해 주세요."
+    if "timeout" in low or "timed out" in low:
+        return "OpenAI 요청 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요."
+    if "connection" in low or "connecterror" in low or "network" in low:
         return "OpenAI 서버에 연결하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도해 주세요."
     return "요청을 처리하지 못했습니다. 파일을 확인한 뒤 다시 시도해 주세요."
 
@@ -991,12 +1090,12 @@ def status_badge(state: dict[str, Any]) -> str:
         "failed": "badge-fail",
     }
     cls = mapping.get(kind, "badge-idle")
-    label = state.get("status_text") or "대기"
+    label = esc(state.get("status_text") or "대기")
     return f'<span class="badge {cls}">{label}</span>'
 
 
 def render_header(state: dict[str, Any]) -> str:
-    label = state.get("source_label") or "데이터 없음"
+    label = esc(state.get("source_label") or "데이터 없음")
     if state.get("source_kind") == "sample":
         kind = "실습 샘플"
     elif state.get("source_kind") == "file":
@@ -1008,7 +1107,7 @@ def render_header(state: dict[str, Any]) -> str:
     <div class="app-header">
       <div>
         <div class="app-kicker">고객사 VOC 분석</div>
-        <div class="app-title">{state.get("view_title") or "데이터 불러오기"}</div>
+        <div class="app-title">{esc(state.get("view_title") or "데이터 불러오기")}</div>
       </div>
       <div class="app-header-meta">
         <div class="meta-block">
@@ -1018,8 +1117,8 @@ def render_header(state: dict[str, Any]) -> str:
         </div>
         <div class="meta-block">
           <div class="meta-k">건수</div>
-          <div class="meta-v">{count_txt}</div>
-          <div class="meta-s">{state.get("period") or "-"}</div>
+          <div class="meta-v">{esc(count_txt)}</div>
+          <div class="meta-s">{esc(state.get("period") or "-")}</div>
         </div>
         <div class="meta-block">
           <div class="meta-k">진행 상태</div>
@@ -1037,7 +1136,7 @@ def render_upload_cards(state: dict[str, Any]) -> str:
     return f"""
     <div class="result-head">
       <h2>현재 적용된 VOC</h2>
-      <p class="result-sub">{state.get("source_label")} · {state.get("overview")}</p>
+      <p class="result-sub">{esc(state.get("source_label"))} · {esc(state.get("overview"))}</p>
     </div>
     <div class="cards">
       <div class="card"><div class="k">VOC 건수</div><div class="v">{state["row_count"]:,}</div><div class="s">불만 내용이 있는 행</div></div>
@@ -1053,7 +1152,7 @@ def render_stats_cards(table: pd.DataFrame, column: str, state: dict[str, Any]) 
         return f"""
         <div class="result-head">
           <h2>항목별 VOC 비율</h2>
-          <p class="result-sub">분석 대상: {state.get("source_label")} · 기준: {column}</p>
+          <p class="result-sub">분석 대상: {esc(state.get("source_label"))} · 기준: {esc(column)}</p>
         </div>
         """
     top = table.iloc[0]
@@ -1062,10 +1161,10 @@ def render_stats_cards(table: pd.DataFrame, column: str, state: dict[str, Any]) 
     return f"""
     <div class="result-head">
       <h2>항목별 VOC 비율</h2>
-      <p class="result-sub">분석 대상: {state.get("source_label")} · 기준: {column} · 비율은 소수점 둘째 자리</p>
+      <p class="result-sub">분석 대상: {esc(state.get("source_label"))} · 기준: {esc(column)} · 비율은 소수점 둘째 자리</p>
     </div>
     <div class="cards">
-      <div class="card"><div class="k">가장 비중이 큰 구분</div><div class="v">{top["항목"]}</div><div class="s">{top["비율(%)"]}% · {top["건수"]}건</div></div>
+      <div class="card"><div class="k">가장 비중이 큰 구분</div><div class="v">{esc(top["항목"])}</div><div class="s">{esc(top["비율(%)"])}% · {esc(top["건수"])}건</div></div>
       <div class="card"><div class="k">집계 건수</div><div class="v">{total:,}</div><div class="s">현재 적용된 VOC</div></div>
       <div class="card"><div class="k">구분 수</div><div class="v">{n_cat}</div><div class="s">건수가 0인 구분은 목록에 없습니다</div></div>
     </div>
@@ -1075,13 +1174,13 @@ def render_stats_cards(table: pd.DataFrame, column: str, state: dict[str, Any]) 
 def render_wc_cards(state: dict[str, Any]) -> str:
     freq = STORE.get("keywords") or {}
     top = list(freq.items())[:5]
-    chips = "".join(f'<span class="kw">{k} <em>{v}</em></span>' for k, v in top)
+    chips = "".join(f'<span class="kw">{esc(k)} <em>{esc(v)}</em></span>' for k, v in top)
     if not chips:
         chips = "<span class='muted'>표시할 키워드가 없습니다.</span>"
     return f"""
     <div class="result-head">
       <h2>불만 키워드</h2>
-      <p class="result-sub">분석 대상: {state.get("source_label")} · 불만 열에서 추출한 상대 빈도</p>
+      <p class="result-sub">분석 대상: {esc(state.get("source_label"))} · 불만 열에서 추출한 상대 빈도</p>
     </div>
     <div class="card">
       <div class="k">자주 등장한 키워드</div>
@@ -1092,7 +1191,12 @@ def render_wc_cards(state: dict[str, Any]) -> str:
 
 
 def render_notice(kind: str, title: str, body: str) -> str:
-    return f'<div class="notice notice-{kind}"><div class="notice-t">{title}</div><div class="notice-b">{body}</div></div>'
+    safe_kind = "info" if kind not in {"info", "busy", "fail"} else kind
+    return (
+        f'<div class="notice notice-{safe_kind}">'
+        f'<div class="notice-t">{esc(title)}</div>'
+        f'<div class="notice-b">{esc(body)}</div></div>'
+    )
 
 
 INFO_UPLOAD = render_notice(
@@ -1105,7 +1209,7 @@ INFO_WC = render_notice("info", "워드클라우드를 아직 만들지 않았�
 INFO_REPORT = render_notice(
     "info",
     "보고서를 아직 만들지 않았습니다",
-    "데이터가 있으면 [보고서 만들기]를 실행하세요. 표와 그림은 이 컴퓨터에서 만들고, 이슈 문장은 OpenAI API가 있을 때 생성합니다.",
+    "데이터가 있으면 [보고서 만들기]를 실행하세요. 표와 그림·DOCX는 이 컴퓨터에서 만들고, 이슈 문장만 OpenAI API가 있을 때 생성합니다. 대표 불만 문구에 이름 등 개인정보가 있으면 그대로 전송될 수 있습니다.",
 )
 
 
@@ -1149,7 +1253,8 @@ def control_updates(busy: bool, state: dict[str, Any], clear_file: bool = False)
 def apply_loaded_df(df: pd.DataFrame, source_kind: str, source_label: str, logger) -> dict[str, Any]:
     with STORE_LOCK:
         STORE["df"] = df
-        STORE["csv_path"] = str(OUTPUT_DIR / "uploaded_voc.csv")
+        STORE["csv_path"] = str(UPLOAD_DIR / "uploaded_voc.csv")
+        STORE["chart_errors"] = {}
         STORE["source_kind"] = source_kind
         STORE["source_label"] = source_label
         STORE["charts"] = {}
@@ -1165,7 +1270,7 @@ def apply_loaded_df(df: pd.DataFrame, source_kind: str, source_label: str, logge
 def do_upload(path: str | Path, source_kind: str, source_label: str, logger: Callable[[str], None]) -> dict[str, Any]:
     logger("CSV를 읽고 열을 확인합니다.")
     df = load_voc_csv(path)
-    save_path = OUTPUT_DIR / "uploaded_voc.csv"
+    save_path = UPLOAD_DIR / "uploaded_voc.csv"
     df.to_csv(save_path, index=False, encoding="utf-8-sig")
     state = apply_loaded_df(df, source_kind, source_label, logger)
     logger("이전 통계·워드클라우드·보고서 결과는 새 데이터와 섞이지 않도록 비웠습니다.")
@@ -1181,89 +1286,33 @@ def do_stats(column: str, logger: Callable[[str], None]) -> tuple[Any, pd.DataFr
     df = require_df()
     if column not in STAT_COLUMNS:
         raise ValueError(f"통계 항목은 {STAT_COLUMNS} 중 하나여야 합니다.")
-    logger(f"VOC Agent | '{column}' 비율 통계·시각화를 시작합니다.")
-    try:
-        voc_agent = make_voc_agent()
-        task = Task(
-            description=(
-                f"업로드된 VOC 데이터에서 '{column}' 항목별 비율 막대그래프를 생성하세요. "
-                f"반드시 analyze_voc_ratio 도구를 1회 호출하고, column 인자는 '{column}' 그대로 사용하세요. "
-                "비율은 소수점 둘째 자리까지입니다."
-            ),
-            expected_output=f"{column}별 건수와 비율(%) 목록, 그래프 파일 경로",
-            agent=voc_agent,
-        )
-        result = run_crew([voc_agent], [task], logger, "VOC-통계")
-        logger("Agent 응답: " + raw_text(result)[:400])
-    except Exception as exc:
-        logger(f"Crew 실행 경고: {exc}. 분석 함수로 그래프를 생성합니다.")
-
-    with STORE_LOCK:
-        fig = STORE["charts"].get(f"{column}_fig")
-        table = STORE["stats"].get(column)
-    if fig is None or table is None:
-        logger("도구 결과를 확인하지 못해 VOC 분석 함수를 직접 실행합니다.")
-        table, fig, png = make_ratio_bar(df, column)
-        logger(f"그래프 저장: {png}")
-    logger(f"VOC Agent | '{column}' 통계 완료 ({len(table)}개 항목)")
+    logger(f"'{column}' 비율을 이 컴퓨터에서 계산합니다. OpenAI는 호출하지 않습니다.")
+    table, fig, png = make_ratio_bar(df, column)
+    if png:
+        logger(f"보고서용 그림 저장: {png.name}")
+    else:
+        logger("보고서용 PNG는 만들지 못했지만, 화면 그래프와 표는 표시합니다.")
+    logger(f"통계 완료 ({len(table)}개 항목)")
     return (fig, table)
 
 
 def do_wordcloud(logger: Callable[[str], None]) -> tuple[str]:
     df = require_df()
-    logger("VOC Agent | 불만 키워드 추출 및 워드클라우드 생성을 시작합니다.")
-    try:
-        voc_agent = make_voc_agent()
-        task = Task(
-            description=(
-                "불만 컬럼에서 한글 키워드를 추출하고 워드클라우드 이미지를 생성하세요. "
-                "반드시 create_voc_wordcloud 도구를 1회 호출하세요. 한글이 깨지지 않아야 합니다."
-            ),
-            expected_output="워드클라우드 파일 경로와 상위 키워드 목록",
-            agent=voc_agent,
-        )
-        result = run_crew([voc_agent], [task], logger, "VOC-워드클라우드")
-        logger("Agent 응답: " + raw_text(result)[:400])
-    except Exception as exc:
-        logger(f"Crew 실행 경고: {exc}. 분석 함수로 워드클라우드를 생성합니다.")
-
-    with STORE_LOCK:
-        path = STORE.get("wordcloud_path")
-    if path is None or not Path(path).exists():
-        logger("도구 결과를 확인하지 못해 워드클라우드 함수를 직접 실행합니다.")
-        path, freq = make_wordcloud(df)
-        logger("상위 키워드: " + ", ".join(list(freq)[:15]))
-    logger(f"VOC Agent | 워드클라우드 완료: {path}")
+    logger("불만 키워드와 워드클라우드를 이 컴퓨터에서 만듭니다. OpenAI는 호출하지 않습니다.")
+    path, freq = make_wordcloud(df)
+    logger("상위 키워드: " + ", ".join(list(freq)[:15]))
+    logger(f"워드클라우드 완료: {Path(path).name}")
     return (str(path),)
 
 
-def do_report(logger: Callable[[str], None]) -> tuple[str | None, str]:
-    df = require_df()
-    logger("보고서 생성 파이프라인을 시작합니다. (VOC → Issue → Report)")
-
-    logger("VOC Agent | 산업군별·분야별 통계와 워드클라우드를 준비합니다.")
-    make_ratio_bar(df, "산업군")
-    make_ratio_bar(df, "분야")
-    if STORE.get("wordcloud_path") is None or not Path(STORE["wordcloud_path"]).exists():
-        make_wordcloud(df)
-    digest = build_voc_digest(df)
-    logger("VOC Agent | 통계 요약 작성 완료")
-
-    result = None
-    issue_text = ""
+def run_issue_analysis(digest: str, api_key: str, logger: Callable[[str], None]) -> str:
+    llm = None
+    crew = None
+    issue_agent = None
+    issue_task = None
     try:
-        voc_agent = make_voc_agent()
-        issue_agent = make_issue_agent()
-        report_agent = make_report_agent()
-        voc_task = Task(
-            description=(
-                "아래 VOC 통계 요약을 검토하고, 보고서 1~3장에 넣을 핵심 수치를 5~8줄로 정리하세요. "
-                "숫자는 요약에 있는 값만 사용하세요.\n\n"
-                f"{digest}"
-            ),
-            expected_output="산업군별·분야별 핵심 수치 요약(소수점 둘째 자리 유지)",
-            agent=voc_agent,
-        )
+        llm = create_llm(api_key)
+        issue_agent = make_issue_agent(llm)
         issue_task = Task(
             description=(
                 "당신은 품질/CS 담당 임원이 대응 우선순위를 정하도록 돕는 분석가입니다.\n"
@@ -1283,56 +1332,100 @@ def do_report(logger: Callable[[str], None]) -> tuple[str | None, str]:
             ),
             expected_output="산업군별 주요 이슈와 개선과제·대응방안 마크다운",
             agent=issue_agent,
-            context=[voc_task],
         )
-        report_task = Task(
-            description=(
-                "앞선 VOC 요약과 이슈 분석을 바탕으로 한글 워드 보고서를 만드세요. "
-                "반드시 create_voc_word_report 도구를 호출하세요. "
-                "issue_analysis 인자에는 이슈 에이전트가 작성한 마크다운 전문을 그대로 넣으세요. "
-                "보고서는 산업군별 통계, 분야별 통계, 워드클라우드, 주요이슈, 대응방안을 포함해야 합니다."
-            ),
-            expected_output="생성된 워드 파일 경로",
-            agent=report_agent,
-            context=[voc_task, issue_task],
-        )
-        result = run_crew(
-            [voc_agent, issue_agent, report_agent],
-            [voc_task, issue_task, report_task],
-            logger,
-            "VOC-Issue-Report",
-        )
-        logger("Report Agent 응답: " + raw_text(result)[:400])
+        result = run_crew([issue_agent], [issue_task], logger, "Issue")
+        text = ""
         try:
             if issue_task.output:
-                issue_text = str(issue_task.output.raw or issue_task.output)
+                text = str(issue_task.output.raw or issue_task.output)
         except Exception:
-            issue_text = STORE.get("issue_analysis") or ""
-        if not issue_text:
-            issue_text = raw_text(result)
-    except Exception as exc:
-        logger(f"Crew 실행 경고: {exc}")
-        issue_text = STORE.get("issue_analysis") or issue_text
+            text = ""
+        if not text:
+            text = raw_text(result)
+        return (text or "").strip()
+    finally:
+        issue_task = None
+        issue_agent = None
+        crew = None
+        llm = None
+
+
+def do_report(logger: Callable[[str], None]) -> dict[str, Any]:
+    df = require_df()
     with STORE_LOCK:
-        STORE["issue_analysis"] = issue_text
-        report_path = STORE.get("report_path")
+        STORE["issue_analysis"] = ""
+        STORE["report_path"] = None
+        STORE["report_missing_images"] = []
 
-    if not issue_text:
+    missing_images: list[str] = []
+    logger("통계와 워드클라우드를 이 컴퓨터에서 준비합니다.")
+    try:
+        _, _, industry_png = make_ratio_bar(df, "산업군")
+        if industry_png is None:
+            missing_images.append("산업군 비율 그림")
+            logger("산업군 비율 PNG를 저장하지 못했습니다.")
+    except Exception as exc:
+        missing_images.append("산업군 비율 그림")
+        logger(f"산업군 통계 실패: {exc}")
+        with STORE_LOCK:
+            STORE["stats"]["산업군"] = ratio_table(df, "산업군")
+    try:
+        _, _, field_png = make_ratio_bar(df, "분야")
+        if field_png is None:
+            missing_images.append("분야 비율 그림")
+            logger("분야 비율 PNG를 저장하지 못했습니다.")
+    except Exception as exc:
+        missing_images.append("분야 비율 그림")
+        logger(f"분야 통계 실패: {exc}")
+        with STORE_LOCK:
+            STORE["stats"]["분야"] = ratio_table(df, "분야")
+    try:
+        wc_path = STORE.get("wordcloud_path")
+        if wc_path is None or not Path(wc_path).exists():
+            make_wordcloud(df)
+    except Exception as exc:
+        missing_images.append("워드클라우드")
+        logger(f"워드클라우드 실패: {exc}")
+
+    digest = build_voc_digest(df)
+    logger("통계 요약 작성 완료. 이슈 문장만 OpenAI를 사용합니다.")
+
+    issue_ok = False
+    api_key = resolve_api_key()
+    if not api_key:
+        logger("API 키가 없어 이슈 문장을 만들지 않습니다.")
         issue_text = (
-            "# 핵심 메시지\n"
-            "에이전트 이슈 분석을 만들지 못했습니다. "
-            "통계와 워드클라우드는 이 컴퓨터에서 계산한 값입니다.\n"
+            "# 이슈 분석을 만들지 못했습니다\n"
+            "OpenAI API 키가 없어 이번 작업에서 산업군별 이슈 문장을 생성하지 않았습니다. "
+            "통계와 그림은 이 컴퓨터에서 계산한 값입니다.\n"
         )
-    if report_path is None or not Path(report_path).exists():
-        logger("보고서 파일이 없어 워드 보고서를 이 컴퓨터에서 만듭니다.")
-        report_path = generate_word_report(issue_text)
-    logger(f"Report Agent | 워드 보고서 준비 완료: {report_path}")
-    preview = issue_text.strip() or "이슈 분석 미리보기를 만들지 못했습니다. 다운로드 파일을 확인하세요."
-    return (str(report_path), preview)
+    else:
+        try:
+            issue_text = run_issue_analysis(digest, api_key, logger)
+            if issue_text:
+                issue_ok = True
+            else:
+                issue_text = (
+                    "# 이슈 분석을 만들지 못했습니다\n"
+                    "에이전트가 이번 작업에서 이슈 문장을 반환하지 않았습니다.\n"
+                )
+        except Exception as exc:
+            logger(f"이슈 생성 실패: {exc}")
+            issue_text = (
+                "# 이슈 분석을 만들지 못했습니다\n"
+                f"{friendly_error(exc)}\n"
+            )
 
-
-# ---------------------------------------------------------------------------
-
+    logger("이번 작업의 이슈 내용으로 워드 파일을 저장합니다.")
+    report_path = generate_word_report(issue_text, missing_images=missing_images)
+    missing_final = list(STORE.get("report_missing_images") or missing_images)
+    logger(f"워드 보고서 저장: {Path(report_path).name}")
+    return {
+        "path": str(report_path),
+        "preview": issue_text,
+        "issue_ok": issue_ok,
+        "missing_images": missing_final,
+    }
 
 
 def stream_logs(work: JobFn, api_key: str | None = None):
@@ -1353,6 +1446,7 @@ def stream_logs(work: JobFn, api_key: str | None = None):
             log_q.put(("err", exc))
         finally:
             set_runtime_api_key(None)
+            setattr(_RUNTIME, "llm", None)
 
     threading.Thread(target=worker, daemon=True).start()
     lines = [f"[{now_ts()}] 작업을 시작합니다."]
@@ -1430,8 +1524,11 @@ def build_ui() -> gr.Blocks:
                 max_lines=1,
             )
             gr.Markdown(
-                "통계 막대그래프와 워드클라우드는 키 없이 이 컴퓨터에서 계산합니다. "
-                "보고서의 이슈 문장을 만들 때는 통계 요약과 대표 불만 문구가 OpenAI로 전송됩니다."
+                "통계·워드클라우드·DOCX 저장은 키 없이 이 컴퓨터에서 처리합니다. "
+                "이슈 문장을 만들 때만 통계 요약과 대표 불만 문구가 OpenAI로 전송됩니다. "
+                "불만 문구에 이름·연락처 등 개인정보가 있으면 함께 전송될 수 있습니다. "
+                "화면에서 입력한 키는 작업이 끝나면 입력란에서 지웁니다. "
+                "환경 변수나 `.env`는 앱이 수정하지 않습니다."
             )
         with gr.Tabs():
             with gr.Tab("데이터 불러오기") as tab_upload:
@@ -1659,7 +1756,7 @@ def build_ui() -> gr.Blocks:
                 *cleared_analysis(),
             )
 
-        def ui_stats(column, state: dict[str, Any], api_key: str = ""):
+        def ui_stats(column, state: dict[str, Any]):
             state = dict(state)
             if not state.get("has_data"):
                 yield (
@@ -1682,17 +1779,20 @@ def build_ui() -> gr.Blocks:
             result = None
             logs = ""
             err = None
-            for phase, logs, payload in stream_logs(lambda lg: do_stats(column, lg), api_key=api_key):
-                if phase == "run":
-                    yield (
-                        state, render_header(state),
-                        render_notice("busy", "비율을 계산하는 중", f"현재 작업: {column}별 VOC 건수와 비율."),
-                        logs, gr.skip(), gr.skip(), gr.skip(), *control_updates(True, state, False),
-                    )
-                elif phase == "err":
-                    err = payload
-                else:
-                    result = payload
+            try:
+                for phase, logs, payload in stream_logs(lambda lg: do_stats(column, lg)):
+                    if phase == "run":
+                        yield (
+                            state, render_header(state),
+                            render_notice("busy", "비율을 계산하는 중", f"현재 작업: {column}별 VOC 건수와 비율."),
+                            logs, gr.skip(), gr.skip(), gr.skip(), *control_updates(True, state, False),
+                        )
+                    elif phase == "err":
+                        err = payload
+                    else:
+                        result = payload
+            except Exception as exc:
+                err = exc
             if err is not None:
                 state["busy"] = False
                 state["status"] = "failed"
@@ -1725,7 +1825,7 @@ def build_ui() -> gr.Blocks:
                 *control_updates(False, state, False),
             )
 
-        def ui_wordcloud(state: dict[str, Any], api_key: str = ""):
+        def ui_wordcloud(state: dict[str, Any]):
             state = dict(state)
             if not state.get("has_data"):
                 yield (
@@ -1747,17 +1847,20 @@ def build_ui() -> gr.Blocks:
             result = None
             logs = ""
             err = None
-            for phase, logs, payload in stream_logs(lambda lg: do_wordcloud(lg), api_key=api_key):
-                if phase == "run":
-                    yield (
-                        state, render_header(state),
-                        render_notice("busy", "키워드 그림을 만드는 중", "한글 폰트로 빈도를 그리는 중입니다."),
-                        logs, gr.skip(), gr.skip(), *control_updates(True, state, False),
-                    )
-                elif phase == "err":
-                    err = payload
-                else:
-                    result = payload
+            try:
+                for phase, logs, payload in stream_logs(lambda lg: do_wordcloud(lg)):
+                    if phase == "run":
+                        yield (
+                            state, render_header(state),
+                            render_notice("busy", "키워드 그림을 만드는 중", "한글 폰트로 빈도를 그리는 중입니다."),
+                            logs, gr.skip(), gr.skip(), *control_updates(True, state, False),
+                        )
+                    elif phase == "err":
+                        err = payload
+                    else:
+                        result = payload
+            except Exception as exc:
+                err = exc
             if err is not None:
                 state["busy"] = False
                 state["status"] = "failed"
@@ -1780,11 +1883,13 @@ def build_ui() -> gr.Blocks:
 
         def ui_report(state: dict[str, Any], api_key: str = ""):
             state = dict(state)
+            key_keep = gr.skip()
+            key_clear = gr.update(value="")
             if not state.get("has_data"):
                 yield (
                     state, render_header(state),
                     render_notice("info", "표시할 데이터가 없습니다", "데이터 불러오기에서 CSV 또는 실습 샘플을 먼저 적용하세요."),
-                    "", gr.skip(), gr.skip(), *control_updates(False, state, False),
+                    "", gr.skip(), gr.skip(), *control_updates(False, state, False), key_keep,
                 )
                 return
             state["busy"] = True
@@ -1793,24 +1898,27 @@ def build_ui() -> gr.Blocks:
             state["view_title"] = "보고서생성"
             yield (
                 state, render_header(state),
-                render_notice("busy", "보고서를 만드는 중", f"{state.get('source_label')} 기준으로 VOC·이슈·보고서를 순서대로 진행합니다. 임의의 진행률은 표시하지 않습니다."),
+                render_notice("busy", "보고서를 만드는 중", f"{state.get('source_label')} 기준으로 로컬 통계 후 이슈 문장을 요청합니다."),
                 f"[{now_ts()}] 보고서 작업을 시작합니다.",
-                gr.skip(), gr.skip(), *control_updates(True, state, False),
+                gr.skip(), gr.skip(), *control_updates(True, state, False), key_keep,
             )
             result = None
             logs = ""
             err = None
-            for phase, logs, payload in stream_logs(lambda lg: do_report(lg), api_key=api_key):
-                if phase == "run":
-                    yield (
-                        state, render_header(state),
-                        render_notice("busy", "보고서를 만드는 중", "이 단계는 시간이 걸릴 수 있습니다."),
-                        logs, gr.skip(), gr.skip(), *control_updates(True, state, False),
-                    )
-                elif phase == "err":
-                    err = payload
-                else:
-                    result = payload
+            try:
+                for phase, logs, payload in stream_logs(lambda lg: do_report(lg), api_key=api_key):
+                    if phase == "run":
+                        yield (
+                            state, render_header(state),
+                            render_notice("busy", "보고서를 만드는 중", "이 단계는 시간이 걸릴 수 있습니다."),
+                            logs, gr.skip(), gr.skip(), *control_updates(True, state, False), key_keep,
+                        )
+                    elif phase == "err":
+                        err = payload
+                    else:
+                        result = payload
+            except Exception as exc:
+                err = exc
             if err is not None:
                 state["busy"] = False
                 state["status"] = "failed"
@@ -1818,22 +1926,36 @@ def build_ui() -> gr.Blocks:
                 yield (
                     state, render_header(state),
                     render_notice("fail", "보고서를 만들지 못했습니다", f"{friendly_error(err)} 잠시 후 다시 실행해 주세요."),
-                    logs, gr.skip(), gr.skip(), *control_updates(False, state, False),
+                    logs, gr.skip(), gr.skip(), *control_updates(False, state, False), key_clear,
                 )
                 return
-            path, preview = result
+            path = result["path"] if isinstance(result, dict) else result[0]
+            preview = result["preview"] if isinstance(result, dict) else result[1]
+            issue_ok = result.get("issue_ok", False) if isinstance(result, dict) else True
+            missing = result.get("missing_images") or [] if isinstance(result, dict) else []
             state["busy"] = False
             state["status"] = "done"
-            state["status_text"] = "분석 완료"
             state["report_ready"] = True
+            notes = []
+            if not issue_ok:
+                notes.append("이슈 문장은 이번 작업에서 만들지 못했습니다.")
+                state["status_text"] = "보고서 저장됨 · 이슈 없음"
+            elif missing:
+                state["status_text"] = "보고서 저장됨 · 일부 그림 없음"
+            else:
+                state["status_text"] = "보고서 저장됨"
+            if missing:
+                notes.append("넣지 못한 그림이 있어 완전한 보고서는 아닙니다: " + ", ".join(str(m) for m in missing))
+            if not notes:
+                notes.append("아래 미리보기와 다운로드 파일은 이번 작업의 같은 이슈 내용입니다.")
             head = (
                 f'<div class="result-head"><h2>VOC 분석 보고서</h2>'
-                f'<p class="result-sub">분석 대상: {state.get("source_label")} · 아래는 이슈 요약입니다. '
+                f'<p class="result-sub">분석 대상: {esc(state.get("source_label"))} · {esc(" ".join(notes))} '
                 f"자료에 없는 일정·담당자는 단정하지 않습니다.</p></div>"
             )
             yield (
                 state, render_header(state), head, logs, path, preview,
-                *control_updates(False, state, False),
+                *control_updates(False, state, False), key_clear,
             )
 
         upload_outs = [
@@ -1854,6 +1976,7 @@ def build_ui() -> gr.Blocks:
         report_outs = [
             app_state, header, report_notice, log_report, report_file, issue_md,
             file_in, btn_upload, btn_sample, btn_stats, btn_wc, btn_report,
+            api_key_in,
         ]
 
         event_kw = dict(show_progress="minimal", concurrency_id="voc-app", concurrency_limit=1)
@@ -1864,8 +1987,8 @@ def build_ui() -> gr.Blocks:
         tab_report.select(lambda s: on_tab(s, "보고서생성"), inputs=[app_state], outputs=[app_state, header], **tab_kw)
         btn_upload.click(ui_upload, inputs=[file_in, app_state], outputs=upload_outs, **event_kw)
         btn_sample.click(ui_sample, inputs=[app_state], outputs=upload_outs, **event_kw)
-        btn_stats.click(ui_stats, inputs=[col_dd, app_state, api_key_in], outputs=stats_outs, **event_kw)
-        btn_wc.click(ui_wordcloud, inputs=[app_state, api_key_in], outputs=wc_outs, **event_kw)
+        btn_stats.click(ui_stats, inputs=[col_dd, app_state], outputs=stats_outs, **event_kw)
+        btn_wc.click(ui_wordcloud, inputs=[app_state], outputs=wc_outs, **event_kw)
         btn_report.click(ui_report, inputs=[app_state, api_key_in], outputs=report_outs, **event_kw)
     return demo
 
@@ -1879,7 +2002,7 @@ def main() -> None:
         theme=gr.themes.Soft(font=[FONT_FAMILY, "sans-serif"]),
         css=APP_CSS,
         footer_links=["gradio"],
-        allowed_paths=[str(BASE_DIR), str(OUTPUT_DIR)],
+        allowed_paths=[str(EXPORT_DIR)],
         show_error=False,
     )
 
